@@ -13,25 +13,21 @@ rm(list = ls())
 
 # load libraries
 library(tidyverse)
+library(PITcleanr)
 library(readxl)
 library(writexl)
-library(PITcleanr)
-library(PITmodelR)
-library(janitor)
+#library(PITmodelR)
 
-# iptds metadata
+# lapwai iptds metadata
 iptds_meta = queryInterrogationMeta() %>%
   filter(siteCode %in% c("LAP", "MIS", "SWT", "WEB")) %>%
   select(-operationsOrganizationCode,
-         -lastFileName,
-         -lastFileOpenedOn,
-         -lastFileClosedOn,
-         -lastFileProcessedOn,
-         -lastTagCode,
-         -lastTagTime)
+         -starts_with("last"),
+         lastYear,
+         lastDate)
 
-# dabom site escapements
-iptds_escape_df = list.files(path = "C:/Git/SnakeRiverFishStatus/output/syntheses",
+# lapwai dabom adult site escapement estimates
+dabom_escape_df = list.files(path = "C:/Git/SnakeRiverFishStatus/output/syntheses",
                             pattern = "\\.xlsx$",
                             full.names = T) %>%
   discard(~ basename(.x) |> stringr::str_starts("~\\$")) %>%   # discard any tmp files
@@ -79,42 +75,7 @@ dabom_obs_df = list.files(path = "C:/Git/SnakeRiverFishStatus/output/life_histor
          total_age,
          brood_year)
 
-# read in all ptagis observations at lapwai iptds, 2010-2025
-lap_int_df = read_csv(file = "data/lapwai_interrogation_summary_ptagis_20251230.csv") %>%
-  clean_names() %>%
-  mutate(
-    site_code = str_sub(site_name, 1, 3),
-    srr = str_c(
-      as.integer(species_code),
-      as.integer(run_code),
-      rear_type_code,
-      sep = ""
-    ),
-    first_time_value = mdy_hms(first_time_value, tz = "America/Los_Angeles"),
-    last_time_value  = mdy_hms(last_time_value, tz = "America/Los_Angeles"),
-    year = year(first_time_value)
-  ) %>%
-  select(tag_code,
-         site_code,
-         first_time_value,
-         year,
-         srr,
-         species_name,
-         run_name,
-         rear_type_name)
-
-table(lap_int_df$year, lap_int_df$species_name)  
-table(lap_int_df$year, lap_int_df$srr)
-
-# retrieve complete tag histories
-lap_cth = lap_int_df %>%
-  distinct(tag_code) %>%
-  pull(tag_code) %>%
-  get_batch_tag_histories()
-
-
-
-# run timing, by year
+# summarize run timing, by year
 run_df = dabom_obs_df %>%
   mutate(julian = yday(min_det)) %>%
   group_by(species, spawn_site, spawn_year, julian) %>%
@@ -156,12 +117,119 @@ run_p = ggplot() +
 run_p
 
 # save run timing plot
-ggsave("output/figures/lapwai_iptds_run_timing.pdf")
+ggsave("output/figures/natural_adult_run_timing_20251230.pdf")
+
+#---------------------------
+# raw lapwai interrogations
+
+# read in all ptagis observations at lapwai iptds queried from ptagis, 2010-2025
+lap_int_df = read_csv(file = "data/lapwai_interrogation_summary_ptagis_20251230.csv") %>%
+  janitor::clean_names() %>%
+  mutate(
+    site_code = str_sub(site_name, 1, 3),
+    srr = str_c(
+      as.integer(species_code),
+      as.integer(run_code),
+      rear_type_code,
+      sep = ""
+    ),
+    first_time_value = mdy_hms(first_time_value, tz = "America/Los_Angeles"),
+    last_time_value  = mdy_hms(last_time_value, tz = "America/Los_Angeles"),
+    year = year(first_time_value)
+  ) %>%
+  select(tag_code,
+         site_code,
+         first_time_value,
+         year,
+         srr,
+         species_name,
+         run_name,
+         rear_type_code)
+
+# retrieve complete tag histories
+# lap_cth = lap_int_df %>%
+#   distinct(tag_code) %>%
+#   pull(tag_code) %>%
+#   get_batch_tag_histories()
+
+# save complete tag histories
+# save(lap_cth, file = "output/lapwai_cths_20251230.rda")
+
+# load complete tag histories
+load("output/lapwai_cths_20251230.rda")
+
+# attach mark info from complete tag histories to detections
+lap_df = lap_int_df %>%
+  left_join(lap_cth %>%
+              filter(event_type == "Mark") %>%
+              select(mark_date = event_date,
+                     mark_site_code = site_code,
+                     mark_site_name = site_name,
+                     tag_code)) %>%
+  # remove some species not of interest (all unknowns are orphan tags); single likely errant green sturgeon observation
+  filter(!species_name %in% c("Northern Pikeminnow", "Unknown", "Green Sturgeon")) %>%
+  # fix likely erroneous run types for steelhead
+  mutate(
+    run_name = if_else(species_name == "Steelhead", "Summer", run_name),
+    srr = if_else(species_name == "Steelhead", str_replace(srr, "^..", "32"), srr)
+  ) %>%
+  # remove few records of unknown run chinook
+  filter(!(species_name == "Chinook" & run_name == "Unknown")) %>%
+  # column to differentiate sp/sum vs. fall run Chinook (for plotting)
+  mutate(spc = case_when(
+    species_name == "Steelhead"                                     ~ "Summer Steelhead",
+    species_name == "Chinook" & run_name %in% c("Spring", "Summer") ~ "Sp/Sum Chinook Salmon",
+    species_name == "Chinook" & run_name == "Fall"                  ~ "Fall Chinook Salmon",
+    species_name == "Coho"                                          ~ "Coho Salmon",
+    TRUE ~ species_name
+  )) %>%
+  mutate(
+    julian = yday(first_time_value),
+    xday = as.Date(julian - 1, origin = "2001-01-01") # dummy year for plotting
+  )
+
+table(lap_df$species_name, lap_df$run_name)
+table(lap_df$year, lap_df$spc)
+
+# jittered detections
+lap_obs_p = lap_df %>%
+  # just most recent 5 years
+  filter(year >= 2021) %>%
+  mutate(year = factor(year)) %>%
+  ggplot(aes(x = xday, y = year, color = rear_type_code)) +
+  geom_jitter(height = 0.25, alpha = 1, size = 0.8) +
+  facet_grid(site_code ~ spc, scales = "free_y", space = "free_y") +
+  scale_x_date(date_breaks = "3 month", date_labels = "%b") +
+  theme_bw() +
+  labs(title = "Timing of Detections, All Life Stages, By Species, 2021-2025",
+       x = NULL,
+       y = NULL, 
+       color = "Rear")
+lap_obs_p
+
+# save run timing plot
+ggsave("output/figures/lapwai_iptds_all_detections_timing_20251230.pdf")
 
 # write some objects to excel
-list("IPTDS_Metadata"   = iptds_meta,
-     "IPTDS_Escapement" = iptds_escape_df,
-     "IPTDS_Detections" = dabom_obs_df) %>%
+list("IPTDS_Metadata"        = iptds_meta,
+     "DABOM_Escapement"      = dabom_escape_df,
+     "DABOM_Detections"      = dabom_obs_df,
+     "All_Lapwai_Detections" = lap_df) %>%
   write_xlsx("output/lapwai_data_request_20251230.xlsx")
+
+# ridge plot
+# library(ggridges)
+# all_obs_timing_p = lap_df %>%
+#   # trim to most recent 5 years, remove small # of remaining U rear_type_code
+#   filter(year >= 2021) %>%
+#   filter(!rear_type_code == "U") %>%
+#   ggplot(aes(x = xday, y = site_code, fill = rear_type_code)) +
+#   geom_density_ridges(scale = 2, alpha = 0.6, color = NA) +
+#   scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+#   facet_wrap(~ spc, ncol = 1, scales = "free_y") +
+#   theme_bw() +
+#   labs(x = NULL, 
+#        y = "Site", 
+#        fill = "Rear Type")
 
 ### END SCRIPT
